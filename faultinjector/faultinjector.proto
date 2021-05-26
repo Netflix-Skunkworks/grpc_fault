@@ -1,5 +1,5 @@
 syntax = "proto3";
-option go_package = "github.com/Netflix-skunkworks/grpc_fault/faultinjector";
+option go_package = "faultinjector";
 
 package faultinjector;
 
