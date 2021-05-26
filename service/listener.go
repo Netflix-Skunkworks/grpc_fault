@@ -21,9 +21,10 @@ func init() {
 	if addr == "" {
 		return
 	}
-	faultinjectionserver := grpc.NewServer()
-	defaultInterceptor = NewInterceptor(context.TODO(), faultinjectionserver)
-	go runListener(addr, faultinjectionserver)
+	go runListener(addr, defaultFaultInjectionServer)
+}
+func isDefaultEnabled() bool {
+	return os.Getenv(FaultInjectorListenerEnv) != ""
 }
 
 func runListener(addr string, faultinjectionserver *grpc.Server) {

@@ -19,7 +19,8 @@ import (
 )
 
 var (
-	defaultInterceptor FaultInjectorInterceptor
+	defaultFaultInjectionServer = grpc.NewServer()
+	defaultInterceptor          = NewInterceptor(context.TODO(), defaultFaultInjectionServer)
 )
 
 type FaultInjectorInterceptor interface {
@@ -32,25 +33,17 @@ type FaultInjectorInterceptor interface {
 // GenerateInterceptor can be used to register an interceptor for a given grpc service. If a service is not registered
 // the interceptor methods will error out
 func RegisterInterceptor(service grpc.ServiceDesc) {
-	if defaultInterceptor == nil {
+	if !isDefaultEnabled() {
 		return
 	}
 	defaultInterceptor.RegisterService(service)
 }
 
 func UnaryClientInterceptor(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-	if defaultInterceptor == nil {
-		return invoker(ctx, method, req, reply, cc, opts...)
-	}
-
 	return defaultInterceptor.UnaryClientInterceptor(ctx, method, req, reply, cc, invoker, opts...)
 }
 
 func StreamClientInterceptor(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-	if defaultInterceptor == nil {
-		return streamer(ctx, desc, cc, method, opts...)
-	}
-
 	return defaultInterceptor.StreamClientInterceptor(ctx, desc, cc, method, streamer, opts...)
 }
 

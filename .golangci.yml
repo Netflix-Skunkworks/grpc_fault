@@ -1,3 +1,4 @@
+
 linters:
   enable:
     - golint
@@ -9,10 +10,3 @@ linters:
     - goimports
     - scopelint
     - gofmt
-run:
-  skip-dirs:
-    - vpc/service/db/migrations
-    - aws
-    - vpc/bpf/filter
-    - vpc/bpf2
-    - vpc/limitsold
