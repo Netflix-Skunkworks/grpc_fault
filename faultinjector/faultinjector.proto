@@ -9,7 +9,7 @@ service FaultInjector {
     rpc EnumerateServices (EnumerateServicesRequest) returns (EnumerateServicesResponse) {}
     rpc RegisterFault (RegisterFaultRequest) returns (RegisterFaultResponse) {}
     rpc RemoveFault (RemoveFaultRequest) returns (RemoveFaultResponse) {}
-
+    rpc Listen (ListenRequest) returns (stream ListenResponse) {}
 };
 
 message EnumerateServicesRequest {
@@ -47,4 +47,15 @@ message RemoveFaultRequest {
 
 message RemoveFaultResponse {
 
+}
+
+message ListenRequest {
+    string service = 1;
+    string method = 2;
+}
+
+message ListenResponse {
+    string request = 1;
+    string reply = 2;
+    string error = 3;
 }

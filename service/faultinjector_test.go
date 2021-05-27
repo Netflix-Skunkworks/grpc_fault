@@ -38,6 +38,7 @@ func TestHarness(t *testing.T) {
 		testBasic,
 		testFaultInjectionInterceptor,
 		testRegistration,
+		testListener,
 	}
 	for idx := range tests {
 		testFunc := tests[idx]
@@ -107,6 +108,35 @@ func testBasic(ctx context.Context, t *testing.T, tc testContext) {
 	assert.NilError(t, err)
 	assert.Assert(t, is.Len(enumerateServicesResponse.Services, 1))
 	t.Log(enumerateServicesResponse.String())
+}
+
+func testListener(ctx context.Context, t *testing.T, tc testContext) {
+	tc.interceptor.RegisterService(helloworld.Greeter_ServiceDesc)
+	enumerateServicesResponse, err := tc.faultinjectorclient.EnumerateServices(ctx, &faultinjectorpb.EnumerateServicesRequest{})
+	assert.NilError(t, err)
+	assert.Assert(t, is.Len(enumerateServicesResponse.Services, 1))
+
+	client, err := tc.faultinjectorclient.Listen(ctx, &faultinjectorpb.ListenRequest{
+		Service: enumerateServicesResponse.Services[0].Name,
+		Method:  enumerateServicesResponse.Services[0].Methods[0].Name,
+	})
+	assert.NilError(t, err)
+
+	helloworldconn, err := grpc.DialContext(ctx, tc.helloworldlistener.Addr().String(), grpc.WithInsecure(), grpc.WithUnaryInterceptor(tc.interceptor.UnaryClientInterceptor))
+	assert.NilError(t, err)
+	helloworldclient := helloworld.NewGreeterClient(helloworldconn)
+	resp, err := helloworldclient.SayHello(ctx, &helloworld.HelloRequest{
+		Name: "Sargun",
+	})
+	assert.NilError(t, err)
+	assert.Assert(t, is.Equal("Sargun", resp.Message))
+
+	message, err := client.Recv()
+	assert.NilError(t, err)
+	assert.Assert(t, message.Reply != "")
+	assert.Assert(t, message.Request != "")
+	assert.Assert(t, message.Error == "")
+
 }
 
 func testFaultInjectionInterceptor(ctx context.Context, t *testing.T, tc testContext) {

@@ -7,15 +7,15 @@ import (
 	"strings"
 	"sync"
 
+	faultinjectorpb "github.com/Netflix-skunkworks/grpc_fault/faultinjector"
 	"github.com/antonmedv/expr"
 	"github.com/antonmedv/expr/vm"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
-	faultinjectorpb "github.com/Netflix-skunkworks/grpc_fault/faultinjector"
+	proto "github.com/golang/protobuf/proto" // nolint: staticcheck
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -61,7 +61,13 @@ func NewInterceptor(ctx context.Context, server *grpc.Server) FaultInjectorInter
 
 type faultInjectorInterceptor struct {
 	// Map of services -> *serviceFaultInjectorInterceptor
-	services sync.Map
+	services  sync.Map
+	listeners sync.Map
+}
+
+type listener struct {
+	servicename string
+	methodname  string
 }
 
 func (f *faultInjectorInterceptor) RegisterService(service grpc.ServiceDesc) {
@@ -98,7 +104,25 @@ func (f *faultInjectorInterceptor) UnaryClientInterceptor(ctx context.Context, m
 			}
 		}
 	}
-	return invoker(ctx, methodAndService, req, reply, cc, opts...)
+	err := invoker(ctx, methodAndService, req, reply, cc, opts...)
+	maybeChan, ok := f.listeners.Load(listener{
+		servicename: serviceName,
+		methodname:  methodName,
+	})
+	if ok {
+		msg := rr{
+			err: err,
+		}
+		if val, ok := req.(proto.Message); ok {
+			msg.req = val
+		}
+		if val, ok := reply.(proto.Message); ok {
+			msg.resp = val
+		}
+		maybeChan.(chan rr) <- msg
+	}
+
+	return err
 }
 
 func (f *faultInjectorInterceptor) StreamClientInterceptor(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
@@ -195,6 +219,51 @@ func (f *faultInjectorServer) RegisterFault(ctx context.Context, req *faultinjec
 	})
 
 	return &faultinjectorpb.RegisterFaultResponse{}, nil
+}
+
+type rr struct {
+	req  proto.Message
+	resp proto.Message
+	err  error
+}
+
+func (f *faultInjectorServer) Listen(req *faultinjectorpb.ListenRequest, resp faultinjectorpb.FaultInjector_ListenServer) error {
+	listenerChannel := make(chan rr, 100)
+	key := listener{
+		servicename: req.Service,
+		methodname:  req.Method,
+	}
+	_, loaded := f.fii.listeners.LoadOrStore(key, listenerChannel)
+
+	if loaded {
+		return status.Errorf(codes.AlreadyExists, "Listener already exists for %s / %s", req.Service, req.Method)
+	}
+
+	defer func() {
+		f.fii.listeners.Delete(key)
+	}()
+
+	for {
+		select {
+		case <-resp.Context().Done():
+			return nil
+		case rr := <-listenerChannel:
+			val := &faultinjectorpb.ListenResponse{
+				Request: rr.req.String(),
+			}
+			if rr.resp != nil {
+				val.Reply = rr.resp.String()
+			}
+			if rr.err != nil {
+				val.Error = rr.err.Error()
+			}
+
+			err := resp.Send(val)
+			if err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func makeCodeFunction(c codes.Code) func(msg string) error {
