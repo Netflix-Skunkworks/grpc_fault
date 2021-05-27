@@ -39,6 +39,7 @@ func TestHarness(t *testing.T) {
 		testFaultInjectionInterceptor,
 		testRegistration,
 		testListener,
+		testNotFound,
 	}
 	for idx := range tests {
 		testFunc := tests[idx]
@@ -108,6 +109,25 @@ func testBasic(ctx context.Context, t *testing.T, tc testContext) {
 	assert.NilError(t, err)
 	assert.Assert(t, is.Len(enumerateServicesResponse.Services, 1))
 	t.Log(enumerateServicesResponse.String())
+}
+
+func testNotFound(ctx context.Context, t *testing.T, tc testContext) {
+	tc.interceptor.RegisterService(helloworld.Greeter_ServiceDesc)
+	_, err := tc.faultinjectorclient.RegisterFault(ctx, &faultinjectorpb.RegisterFaultRequest{
+		Service: "helloworld.Greeter",
+		Method:  "NotFound",
+	})
+	assert.ErrorContains(t, err, "NotFound")
+
+	stream, err := tc.faultinjectorclient.Listen(ctx, &faultinjectorpb.ListenRequest{
+		Service: "helloworld.Greeter",
+		Method:  "Foo",
+	})
+	// Errors are synchronous in streaming requests?
+	assert.NilError(t, err)
+
+	_, err = stream.Recv()
+	assert.ErrorContains(t, err, "NotFound")
 }
 
 func testListener(ctx context.Context, t *testing.T, tc testContext) {

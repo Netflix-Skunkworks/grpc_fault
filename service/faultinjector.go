@@ -61,19 +61,18 @@ func NewInterceptor(ctx context.Context, server *grpc.Server) FaultInjectorInter
 
 type faultInjectorInterceptor struct {
 	// Map of services -> *serviceFaultInjectorInterceptor
-	services  sync.Map
-	listeners sync.Map
-}
-
-type listener struct {
-	servicename string
-	methodname  string
+	services sync.Map
 }
 
 func (f *faultInjectorInterceptor) RegisterService(service grpc.ServiceDesc) {
-	f.services.LoadOrStore(service.ServiceName, &serviceFaultInjectorInterceptor{
+	sfii := &serviceFaultInjectorInterceptor{
 		service: service,
-	})
+	}
+	for idx := range service.Methods {
+		method := service.Methods[idx]
+		sfii.methods.Store(method.MethodName, &methodFaultInjectorInterceptor{})
+	}
+	f.services.LoadOrStore(service.ServiceName, sfii)
 }
 
 func (f *faultInjectorInterceptor) UnaryClientInterceptor(ctx context.Context, methodAndService string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
@@ -84,42 +83,51 @@ func (f *faultInjectorInterceptor) UnaryClientInterceptor(ctx context.Context, m
 	splitMethod := strings.Split(strings.TrimLeft(methodAndService, "/"), "/")
 	serviceName := splitMethod[0]
 	methodName := splitMethod[1]
+	msg := rr{}
+	if val, ok := req.(proto.Message); ok {
+		msg.req = val
+	}
+
+	var messageChan chan rr
 	val, ok := f.services.Load(serviceName)
 	if ok {
 		sfii := val.(*serviceFaultInjectorInterceptor)
 		val, ok = sfii.methods.Load(methodName)
 		if ok {
 			mfii := val.(*methodFaultInjectorInterceptor)
-			val, err := vm.Run(mfii.program, makeEnv(req))
-			if err != nil {
-				log.Ctx(ctx).WithLevel(zerolog.WarnLevel).Err(err).Msg("Could not run program")
-			} else if val != nil {
-				err, ok := val.(error)
-				if !ok {
-					log.Ctx(ctx).WithLevel(zerolog.WarnLevel).Str("type", fmt.Sprintf("%T", err)).Msg("Received unexpected type from program")
-				}
-				if status.Code(err) != codes.OK {
-					return err
+			mfii.lock.RLock()
+			program := mfii.program
+			messageChan = mfii.messageChan
+			mfii.lock.RUnlock()
+			if program != nil {
+				val, err := vm.Run(program, makeEnv(req))
+				if err != nil {
+					log.Ctx(ctx).WithLevel(zerolog.WarnLevel).Err(err).Msg("Could not run program")
+				} else if val != nil {
+					err, ok := val.(error)
+					if !ok {
+						log.Ctx(ctx).WithLevel(zerolog.WarnLevel).Str("type", fmt.Sprintf("%T", err)).Msg("Received unexpected type from program")
+					}
+					if status.Code(err) != codes.OK {
+						msg.err = err
+						select {
+						case messageChan <- msg:
+						default:
+						}
+						return err
+					}
 				}
 			}
 		}
 	}
 	err := invoker(ctx, methodAndService, req, reply, cc, opts...)
-	maybeChan, ok := f.listeners.Load(listener{
-		servicename: serviceName,
-		methodname:  methodName,
-	})
-	if ok {
-		msg := rr{
-			err: err,
-		}
-		if val, ok := req.(proto.Message); ok {
-			msg.req = val
-		}
-		if val, ok := reply.(proto.Message); ok {
-			msg.resp = val
-		}
-		maybeChan.(chan rr) <- msg
+	msg.err = err
+	if val, ok := reply.(proto.Message); ok {
+		msg.resp = val
+	}
+	select {
+	case messageChan <- msg:
+	default:
 	}
 
 	return err
@@ -136,23 +144,14 @@ type serviceFaultInjectorInterceptor struct {
 	methods sync.Map
 }
 
-func (s *serviceFaultInjectorInterceptor) getMethod(name string) *grpc.MethodDesc {
-	for idx := range s.service.Methods {
-		method := s.service.Methods[idx]
-		if method.MethodName == name {
-			return &method
-		}
-	}
-	return nil
-}
-
 type methodFaultInjectorInterceptor struct {
-	expression string
-	program    *vm.Program
+	lock        sync.RWMutex
+	expression  string
+	program     *vm.Program
+	messageChan chan rr
 }
 
 type faultInjectorServer struct {
-	faultinjectorpb.UnimplementedFaultInjectorServer
 	fii *faultInjectorInterceptor
 }
 
@@ -160,27 +159,25 @@ func (f *faultInjectorServer) EnumerateServices(ctx context.Context, request *fa
 	resp := faultinjectorpb.EnumerateServicesResponse{}
 	f.fii.services.Range(func(key, value interface{}) bool {
 		servicename := key.(string)
-		fi := value.(*serviceFaultInjectorInterceptor)
 		methods := []*faultinjectorpb.Method{}
-		for idx := range fi.service.Methods {
-			methodDesc := fi.service.Methods[idx]
-			method := &faultinjectorpb.Method{
-				Name: methodDesc.MethodName,
-			}
-			val, ok := fi.methods.Load(methodDesc.MethodName)
-			if ok {
-				mfii := val.(*methodFaultInjectorInterceptor)
-				method.Expression = mfii.expression
-			}
 
-			methods = append(methods, method)
-		}
+		sfii := value.(*serviceFaultInjectorInterceptor)
+		sfii.methods.Range(func(key, value interface{}) bool {
+			methodName := key.(string)
+			mfii := value.(*methodFaultInjectorInterceptor)
+			mfii.lock.RLock()
+			methods = append(methods, &faultinjectorpb.Method{
+				Name:       methodName,
+				Expression: mfii.expression,
+			})
+			mfii.lock.RUnlock()
 
-		svc := &faultinjectorpb.Service{
+			return true
+		})
+		resp.Services = append(resp.Services, &faultinjectorpb.Service{
 			Name:    servicename,
 			Methods: methods,
-		}
-		resp.Services = append(resp.Services, svc)
+		})
 
 		return true
 	})
@@ -194,16 +191,17 @@ func (f *faultInjectorServer) RegisterFault(ctx context.Context, req *faultinjec
 	}
 
 	service := val.(*serviceFaultInjectorInterceptor)
-	method := service.getMethod(req.Method)
-	if method == nil {
+	val, ok = service.methods.Load(req.Method)
+	if !ok {
 		return nil, status.Errorf(codes.NotFound, "method %s not found", req.Method)
 	}
+	mfii := val.(*methodFaultInjectorInterceptor)
 
 	// ht is the interface of the service.
 	ht := reflect.TypeOf(service.service.HandlerType).Elem()
-	reflectedMethod, ok := ht.MethodByName(method.MethodName)
+	reflectedMethod, ok := ht.MethodByName(req.Method)
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "method %s not found on reflection", method.MethodName)
+		return nil, status.Errorf(codes.NotFound, "method %s not found on reflection", req.Method)
 	}
 
 	fakeReq := reflect.New(reflectedMethod.Type.In(1)).Interface()
@@ -213,10 +211,10 @@ func (f *faultInjectorServer) RegisterFault(ctx context.Context, req *faultinjec
 		return nil, status.Errorf(codes.InvalidArgument, "Could not compile the program: %s", err.Error())
 	}
 
-	service.methods.Store(method.MethodName, &methodFaultInjectorInterceptor{
-		expression: req.Expression,
-		program:    pgrm,
-	})
+	mfii.lock.Lock()
+	mfii.program = pgrm
+	mfii.expression = req.Expression
+	mfii.lock.Unlock()
 
 	return &faultinjectorpb.RegisterFaultResponse{}, nil
 }
@@ -229,18 +227,31 @@ type rr struct {
 
 func (f *faultInjectorServer) Listen(req *faultinjectorpb.ListenRequest, resp faultinjectorpb.FaultInjector_ListenServer) error {
 	listenerChannel := make(chan rr, 100)
-	key := listener{
-		servicename: req.Service,
-		methodname:  req.Method,
-	}
-	_, loaded := f.fii.listeners.LoadOrStore(key, listenerChannel)
 
-	if loaded {
+	val, ok := f.fii.services.Load(req.Service)
+	if !ok {
+		return status.Errorf(codes.NotFound, "Service %s not found", req.Service)
+	}
+	sfii := val.(*serviceFaultInjectorInterceptor)
+
+	val, ok = sfii.methods.Load(req.Method)
+	if !ok {
+		return status.Errorf(codes.NotFound, "Method %s not found", req.Method)
+	}
+
+	mfii := val.(*methodFaultInjectorInterceptor)
+	mfii.lock.Lock()
+	if mfii.messageChan != nil {
+		mfii.lock.Unlock()
 		return status.Errorf(codes.AlreadyExists, "Listener already exists for %s / %s", req.Service, req.Method)
 	}
+	mfii.messageChan = listenerChannel
+	mfii.lock.Unlock()
 
 	defer func() {
-		f.fii.listeners.Delete(key)
+		mfii.lock.Lock()
+		defer mfii.lock.Unlock()
+		mfii.messageChan = nil
 	}()
 
 	for {
@@ -306,6 +317,15 @@ func (f *faultInjectorServer) RemoveFault(ctx context.Context, req *faultinjecto
 	}
 	service := val.(*serviceFaultInjectorInterceptor)
 
-	service.methods.Delete(req.Method)
+	val, ok = service.methods.Load(req.Method)
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "method %s not found", req.Service)
+	}
+	method := val.(*methodFaultInjectorInterceptor)
+	method.lock.Lock()
+	defer method.lock.Unlock()
+	method.expression = ""
+	method.program = nil
+
 	return &faultinjectorpb.RemoveFaultResponse{}, nil
 }
